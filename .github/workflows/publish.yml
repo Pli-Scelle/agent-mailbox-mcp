@@ -1,0 +1,94 @@
+# Publishes @pliscelle/agent-mailbox-mcp to npm with a build provenance
+# attestation. This workflow exists here, and not in Pli Scelle's own forge,
+# for one reason: `npm publish --provenance` asks Sigstore's Fulcio for a
+# signing certificate, and Fulcio only trusts the OIDC issuers listed in its
+# identity config. A self-hosted GitLab is not one of them, so the publish
+# there dies with "(400) There was an error processing the identity token".
+# `token.actions.githubusercontent.com` is on that list, which is what makes
+# the signature possible at all.
+#
+# Everything in this repository is generated from the source repository by
+# `tools/scripts/build-mcp-mirror.mjs`, tag included. Never edit it here.
+name: publish
+
+on:
+    push:
+        tags:
+            - 'v*'
+
+permissions:
+    contents: read
+    # What lets the runner mint the OIDC token npm and Sigstore verify.
+    # Without it, the publish has neither an identity to authenticate with
+    # nor an issuer Fulcio will sign for.
+    id-token: write
+
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+        steps:
+            # Actions epinglees au SHA, jamais a un tag : un tag se repointe
+            # silencieusement par son proprietaire, et ce workflow signe et
+            # publie. C'est le vecteur des compromissions de trivy-action et de
+            # kics-github-action. Le tag lisible reste en commentaire pour
+            # savoir ce qu'on met a jour le jour ou on le fait.
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: 24
+                  registry-url: 'https://registry.npmjs.org'
+
+            # No lockfile is mirrored: every direct dependency is pinned to an
+            # exact version in package.json, and a lockfile generated outside
+            # this repository would pin a tree nothing here ever resolved.
+            - run: npm install --no-audit --no-fund
+
+            - run: npm run typecheck
+            - run: npm test
+            - run: npm run build
+
+            # Trusted publishing: no npm token exists anywhere, here or in Pli
+            # Scelle's own forge. The registry is told, once, that this
+            # workflow in this repository may publish this package, and each
+            # run authenticates with a short-lived OIDC token it cannot leak
+            # because it never holds one. Requires npm 11.5.1 or newer, which
+            # the Node 24 runner already ships; the guard below fails loudly
+            # rather than falling back to an anonymous publish.
+            - name: Publish
+              run: |
+                  set -euo pipefail
+                  NPM_VERSION=$(npm --version)
+                  if [ "$(printf '%s\n11.5.1\n' "$NPM_VERSION" | sort -V | head -n1)" != "11.5.1" ]; then
+                    echo "FAIL: npm ${NPM_VERSION} is older than 11.5.1 and cannot publish with trusted publishing."
+                    exit 1
+                  fi
+
+                  PKG_NAME=$(node -p "require('./package.json').name")
+                  PKG_VERSION=$(node -p "require('./package.json').version")
+
+                  if npm view "${PKG_NAME}@${PKG_VERSION}" version >/dev/null 2>&1; then
+                    echo "${PKG_NAME}@${PKG_VERSION} is already on the registry, nothing to publish."
+                    exit 0
+                  fi
+
+                  # `--provenance` stays explicit even though trusted
+                  # publishing attaches an attestation on its own: passing it
+                  # makes the publish FAIL if an attestation cannot be
+                  # produced, instead of quietly shipping an unsigned tarball.
+                  npm publish --provenance --access public
+
+                  # `npm publish` exiting 0 is not proof that an attestation
+                  # was attached: a misconfigured OIDC environment can still
+                  # let the publish through unsigned. This reads the registry's
+                  # own record of what landed. It deliberately does not try to
+                  # unpublish on failure, a destructive and narrowly timed
+                  # operation that a read-after-write lag would trigger on a
+                  # perfectly good release. A human investigates instead.
+                  sleep 5
+                  ATTESTATION_URL=$(npm view "${PKG_NAME}@${PKG_VERSION}" dist.attestations.url 2>/dev/null || true)
+                  if [ -z "$ATTESTATION_URL" ]; then
+                    echo "FAIL: ${PKG_NAME}@${PKG_VERSION} was published but the registry shows no provenance attestation. This release is NOT signed. Investigate before trusting this workflow again; unpublish by hand if warranted."
+                    exit 1
+                  fi
+                  echo "OK: ${PKG_NAME}@${PKG_VERSION} published with provenance attestation: ${ATTESTATION_URL}"
