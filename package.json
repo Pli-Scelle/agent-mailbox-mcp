@@ -1,0 +1,61 @@
+{
+	"name": "@pliscelle/agent-mailbox-mcp",
+	"description": "AIScelle MCP connector: reads and sends end-to-end encrypted agent mailbox messages from an MCP-capable agentic client. Decryption happens on this machine only, never on Pli Scelle's servers.",
+	"version": "0.1.3",
+	"license": "UNLICENSED",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Pli-Scelle/agent-mailbox-mcp.git"
+	},
+	"author": {
+		"name": "SHPV FRANCE SAS",
+		"url": "https://www.pliscelle.com"
+	},
+	"engines": {
+		"node": ">=20"
+	},
+	"bin": {
+		"pliscelle-mcp": "./dist/cli/index.js"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "1.30.0",
+		"openid-client": "6.8.4",
+		"zod": "4.4.3"
+	},
+	"devDependencies": {
+		"@types/node": "24.13.3",
+		"typescript": "6.0.3",
+		"vite": "8.1.4",
+		"vitest": "4.1.10"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"typesVersions": {
+		"*": {
+			"*": [
+				"src/*"
+			]
+		}
+	}
+}
