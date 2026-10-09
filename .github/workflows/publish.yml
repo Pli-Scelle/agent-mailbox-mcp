@@ -1,0 +1,241 @@
+# Publishes @pliscelle/agent-mailbox-mcp to npm with a build provenance
+# attestation. This workflow exists here, and not in Pli Scelle's own forge,
+# for one reason: `npm publish --provenance` asks Sigstore's Fulcio for a
+# signing certificate, and Fulcio only trusts the OIDC issuers listed in its
+# identity config. A self-hosted GitLab is not one of them, so the publish
+# there dies with "(400) There was an error processing the identity token".
+# `token.actions.githubusercontent.com` is on that list, which is what makes
+# the signature possible at all.
+#
+# Everything in this repository is generated from the source repository by
+# `tools/scripts/build-mcp-mirror.mjs`. The release tag is not: the `tag` job
+# below creates it, after a real publication. Never edit anything here.
+name: publish
+
+on:
+    push:
+        branches:
+            - main
+
+# One run at a time. Without it, two pushes to main in quick succession run
+# side by side: both read the version as missing from the registry, both try
+# to publish it, and one fails on a duplicate version. Runs are queued, never
+# cancelled mid-publish. GitHub keeps at most one pending run per group: a
+# newer push replaces an older pending run, which is harmless here because
+# the newer tree is the one main now holds.
+concurrency:
+    group: ${{ github.workflow }}
+    cancel-in-progress: false
+
+# Nothing by default. Each job asks for exactly what it needs. Third-party
+# code (install, typecheck, test, build) runs only in `build`, which holds no
+# token that can publish to npm or write to this repository.
+permissions: {}
+
+jobs:
+    # Installs an unlocked dependency tree and runs its scripts, so it holds
+    # nothing but a read token. Its only output is the tarball `npm pack`
+    # makes after the build, handed to `publish` as an artifact of this run.
+    build:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        outputs:
+            name: ${{ steps.pack.outputs.name }}
+            version: ${{ steps.pack.outputs.version }}
+            tarball: ${{ steps.pack.outputs.tarball }}
+        steps:
+            # Actions epinglees au SHA, jamais a un tag : un tag se repointe
+            # silencieusement par son proprietaire, et ce workflow signe et
+            # publie. C'est le vecteur des compromissions de trivy-action et de
+            # kics-github-action. Le tag lisible reste en commentaire pour
+            # savoir ce qu'on met a jour le jour ou on le fait.
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  # Nothing in this job talks to git remotes. Keeping the token
+                  # out of .git/config keeps it out of reach of the install and
+                  # lifecycle scripts below.
+                  persist-credentials: false
+
+            - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: 24
+
+            # No lockfile is mirrored: every direct dependency is pinned to an
+            # exact version in package.json, and a lockfile generated outside
+            # this repository would pin a tree nothing here ever resolved.
+            - run: npm install --no-audit --no-fund
+
+            - run: npm run typecheck
+            - run: npm test
+            - run: npm run build
+
+            # After the build, so the tarball carries dist/.
+            - name: Pack
+              id: pack
+              run: |
+                  set -euo pipefail
+                  TARBALL=$(npm pack --silent)
+                  {
+                    echo "name=$(node -p "require('./package.json').name")"
+                    echo "version=$(node -p "require('./package.json').version")"
+                    echo "tarball=${TARBALL}"
+                  } >> "$GITHUB_OUTPUT"
+
+            - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+              with:
+                  name: package
+                  path: ${{ steps.pack.outputs.tarball }}
+                  if-no-files-found: error
+                  retention-days: 1
+
+    # Holds the token that publishes, and runs no third-party code: no
+    # checkout, no install, no package script. It publishes the tarball
+    # `build` produced, exactly as tested.
+    publish:
+        needs: build
+        runs-on: ubuntu-latest
+        permissions:
+            # What lets the runner mint the OIDC token npm and Sigstore verify.
+            # Without it, the publish has neither an identity to authenticate
+            # with nor an issuer Fulcio will sign for.
+            id-token: write
+        outputs:
+            # "true" only when THIS run ran `npm publish` and the registry then
+            # showed its attestation. The `tag` job reads it, so a tag always
+            # lands on the tree this run published, never on a later tree that
+            # merely carries an already published version number.
+            published: ${{ steps.publish.outputs.published }}
+            version: ${{ steps.publish.outputs.version }}
+        steps:
+            - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: 24
+                  registry-url: 'https://registry.npmjs.org'
+
+            - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              with:
+                  name: package
+
+            # Trusted publishing: no npm token exists anywhere, here or in Pli
+            # Scelle's own forge. The registry is told, once, that this
+            # workflow in this repository may publish this package, and each
+            # run authenticates with a short-lived OIDC token it cannot leak
+            # because it never holds one. Requires npm 11.5.1 or newer, which
+            # the Node 24 runner already ships; the guard below fails loudly
+            # rather than falling back to an anonymous publish.
+            - name: Publish
+              id: publish
+              env:
+                  PKG_NAME: ${{ needs.build.outputs.name }}
+                  PKG_VERSION: ${{ needs.build.outputs.version }}
+                  TARBALL: ${{ needs.build.outputs.tarball }}
+              run: |
+                  set -euo pipefail
+                  NPM_VERSION=$(npm --version)
+                  if [ "$(printf '%s\n11.5.1\n' "$NPM_VERSION" | sort -V | head -n1)" != "11.5.1" ]; then
+                    echo "FAIL: npm ${NPM_VERSION} is older than 11.5.1 and cannot publish with trusted publishing."
+                    exit 1
+                  fi
+
+                  # Idempotence guard: skip the publish if the version is
+                  # already on the registry. This is the guard that counts, and
+                  # it lives here, on the registry, not on the mirror. A version
+                  # already published must never be republished, whatever the
+                  # tag state.
+                  PUBLISHED=false
+                  if npm view "${PKG_NAME}@${PKG_VERSION}" version >/dev/null 2>&1; then
+                    echo "${PKG_NAME}@${PKG_VERSION} is already on the registry, nothing to publish."
+                  else
+                    # `--provenance` stays explicit even though trusted
+                    # publishing attaches an attestation on its own: passing it
+                    # makes the publish FAIL if an attestation cannot be
+                    # produced, instead of quietly shipping an unsigned tarball.
+                    # `--ignore-scripts`: no package script runs in the job
+                    # that holds the publishing token.
+                    npm publish "./${TARBALL}" --provenance --access public --ignore-scripts
+                    PUBLISHED=true
+                  fi
+
+                  # `npm publish` exiting 0 is not proof that an attestation
+                  # was attached: a misconfigured OIDC environment can still
+                  # let the publish through unsigned. This reads the registry's
+                  # own record of what landed. It deliberately does not try to
+                  # unpublish on failure, a destructive and narrowly timed
+                  # operation that a read-after-write lag would trigger on a
+                  # perfectly good release. A human investigates instead.
+                  # Retried rather than read once: the registry needs a few
+                  # seconds before it serves what it just accepted, and a
+                  # single read five seconds in reported a perfectly signed
+                  # 0.1.0 as unsigned on 2026-08-30. A check that cries wolf
+                  # about an unsigned release is worse than no check, since
+                  # the message it prints invites a human to unpublish it.
+                  ATTESTATION_URL=""
+                  for attempt in 1 2 3 4 5 6; do
+                    ATTESTATION_URL=$(npm view "${PKG_NAME}@${PKG_VERSION}" dist.attestations.url 2>/dev/null || true)
+                    [ -n "$ATTESTATION_URL" ] && break
+                    echo "Attestation not visible yet (attempt ${attempt}), waiting."
+                    sleep 10
+                  done
+                  if [ -z "$ATTESTATION_URL" ]; then
+                    echo "FAIL: ${PKG_NAME}@${PKG_VERSION} was published but the registry still shows no provenance attestation after a minute. This release may not be signed. Read the publish output above: if it says the provenance statement was published to the transparency log, the release IS signed and only this check is at fault. Investigate before unpublishing anything."
+                    exit 1
+                  fi
+                  echo "OK: ${PKG_NAME}@${PKG_VERSION} published with provenance attestation: ${ATTESTATION_URL}"
+
+                  # Written last, after the attestation check: a run whose
+                  # check failed never reports itself as published.
+                  {
+                    echo "published=${PUBLISHED}"
+                    echo "version=${PKG_VERSION}"
+                  } >> "$GITHUB_OUTPUT"
+
+    # The tag is the trace of a real publication, not a promise. It runs only
+    # when the `publish` job of THIS run published, so it always points at the
+    # tree that went to the registry. A version already published by an
+    # earlier run is never tagged here: if that earlier run published but its
+    # tag job failed, re-run that run's failed jobs, which keeps the `publish`
+    # outputs and the same commit.
+    #
+    # This job is the only one that can write to the repository, and it runs
+    # no npm and no checkout: no third-party code ever sees its token. A tag
+    # created with the GITHUB_TOKEN does not trigger a workflow run, and it is
+    # not a push on main either.
+    tag:
+        needs: publish
+        if: needs.publish.outputs.published == 'true'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Tag the mirror
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: v${{ needs.publish.outputs.version }}
+              run: |
+                  set -euo pipefail
+                  if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+                    echo "FAIL: '${TAG}' is not a release tag."
+                    exit 1
+                  fi
+
+                  # Exit 2 means the tag is absent. Any other non-zero exit is
+                  # a failure to read the mirror, never a reason to tag.
+                  rc=0
+                  git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}" >/dev/null || rc=$?
+                  case "${rc}" in
+                    0)
+                      echo "${TAG} already exists on the mirror, nothing to tag."
+                      exit 0
+                      ;;
+                    2) ;;
+                    *)
+                      echo "FAIL: could not read the tags of the mirror (git ls-remote exit ${rc})."
+                      exit 1
+                      ;;
+                  esac
+
+                  gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                    -f ref="refs/tags/${TAG}" \
+                    -f sha="${GITHUB_SHA}" >/dev/null
+                  echo "Tagged ${TAG} at ${GITHUB_SHA}, the commit this run published."
